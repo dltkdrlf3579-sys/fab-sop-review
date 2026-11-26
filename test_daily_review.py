@@ -1,5 +1,6 @@
 import json
 import os
+from collections import Counter
 from uuid import uuid4
 import sys
 import tempfile
@@ -7,10 +8,12 @@ import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, current_thread
 from unittest.mock import MagicMock, Mock, patch
 
-from run_daily import HERE, load_llm_settings, main, request_review, run_reviews, waiting
+import requests
+from run_daily import (HERE, RetryableReviewError, load_llm_settings, main, request_review,
+                       retry_after_seconds, retry_delay, run_reviews, waiting)
 from notifications import deliver_pending
 from regulation_search import RegulationSearch, words
 from fab_batch import read_config
@@ -183,8 +186,7 @@ class DailyReviewTest(unittest.TestCase):
             try:
                 self.assertTrue(full.wait(10))
                 if (sop, step) == ("B", 30) and hits.count(("B", 30)) == 1:
-                    return {"status": "complete", "findings": [{"step": 1, "kind": "확인 요청",
-                            "message": "확인해 주세요.", "ref": "E1", "quote": "B-30"}]}
+                    return {"status": "held", "findings": [], "reason": "근거 적용 조건 확인 필요"}
                 return {"status": "complete", "findings": []}
             finally:
                 with lock:
@@ -208,6 +210,83 @@ class DailyReviewTest(unittest.TestCase):
             cfg["review"]["max_concurrent_requests"] = "51"
             with self.assertRaises(ValueError):
                 run()
+
+    def test_retry_pool_saturates_alongside_new_work_and_recovers_in_one_run(self):
+        docs = {(sop, "1"): [
+            {"SOP제목": sop, "주작업명": "work", "주작업순번": "1", "하위작업순번": str(i),
+             "하위작업내용": f"row {i}"} for i in range(1, size + 1)
+        ] for sop, size in (("retry-doc", 11), ("normal-doc", 50))}
+        cfg = read_config(HERE / "config.example.ini")
+        cfg["llm"].update({"model_name": "fixture", "base_url": "https://fixture.invalid"})
+        store = Mock()
+        store.is_current.return_value = False
+        store.load_steps.side_effect = lambda *args: {}
+        store.save_step.side_effect = lambda sop, key, step, result: result
+        store.save.return_value = "검토 완료"
+        search = Mock(index_hash="idx")
+        search.evidence.return_value = [{"ref":"E1", "id":"1", "source":"fixture", "text":"ground"}]
+        lock, saturated = Lock(), Event()
+        active, calls, saves = Counter(), Counter(), Counter()
+        def respond(url, **kwargs):
+            body = json.loads(kwargs["json"]["messages"][1]["content"])
+            sop, step = body["rows"][0]["SOP제목"], body["target_step"]
+            lane = current_thread().name.split("_")[0]
+            with lock:
+                calls[sop, step] += 1
+                attempt = calls[sop, step]
+                active[lane] += 1
+                self.assertLessEqual(active["first"], 50)
+                self.assertLessEqual(active["retry"], 10)
+                if active["first"] == 50 and active["retry"] == 10:
+                    saturated.set()
+            try:
+                if sop == "retry-doc" and attempt == 1:
+                    raise requests.ReadTimeout("fixture timeout")
+                self.assertTrue(saturated.wait(10))
+                findings = []
+                if sop == "retry-doc" and step == 1 and attempt < 5:
+                    findings = [{"step":2 if attempt == 2 else 1, "ref":"E1", "kind":"확인 요청",
+                                 "quote":"ground" if attempt == 2 else "incorrect", "message":"확인해 주세요."}]
+                response = Mock(status_code=200)
+                response.json.return_value = {"choices":[{"message":{"content":
+                    json.dumps({"status":"complete", "findings":findings})}}]}
+                return response
+            finally:
+                with lock:
+                    active[lane] -= 1
+        with (patch("run_daily.RegulationSearch", return_value=search),
+              patch("run_daily.requests.post", side_effect=respond), patch("run_daily.retry_delay", return_value=0),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            counts = dict.fromkeys(("검토 완료", "검토 미완료", "재사용"), 0)
+            run_reviews(docs, store, cfg, HERE, counts)
+        self.assertTrue(saturated.is_set())
+        self.assertEqual(counts["검토 완료"], 2)
+        self.assertEqual(calls["retry-doc", 1], 5)
+        for call in store.save_step.call_args_list:
+            sop, _, step, _ = call.args
+            saves[sop, step] += 1
+        self.assertEqual(saves, dict.fromkeys(calls, 1))
+        self.assertTrue(all(calls["normal-doc", i] == 1 for i in range(1,51)))
+
+    def test_transient_errors_and_retry_after(self):
+        cfg = read_config(HERE / "config.example.ini")
+        cfg["llm"].update({"model_name":"fixture", "base_url":"https://fixture.invalid"})
+        for status in (408, 429, 503):
+            with self.subTest(status=status), patch("run_daily.requests.post",
+                    return_value=Mock(status_code=status, headers={"Retry-After":"37"})):
+                with self.assertRaises(RetryableReviewError) as retry:
+                    request_review(cfg, "prompt", "{}")
+                self.assertEqual(retry.exception.retry_after, 37)
+        for status in (400, 401, 403):
+            with patch("run_daily.requests.post", return_value=Mock(status_code=status)):
+                with self.assertRaises(ValueError) as error:
+                    request_review(cfg, "prompt", "{}")
+                self.assertNotIsInstance(error.exception, RetryableReviewError)
+        with patch("run_daily.time", return_value=0):
+            self.assertEqual(retry_after_seconds("Thu, 01 Jan 1970 00:00:13 GMT"), 13)
+        self.assertEqual(retry_after_seconds("invalid"), 0)
+        self.assertGreaterEqual(retry_delay(10, 350), 350)
+        self.assertLessEqual(retry_delay(10000, 0), 300)
 
     def test_inline_and_external_llm_settings(self):
         cfg = read_config(HERE / "config.example.ini")
@@ -256,7 +335,8 @@ class DailyReviewTest(unittest.TestCase):
                 findings = []
             response = Mock(status_code=200)
             response.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content":
-                json.dumps({"status": "complete", "reason": "", "findings": findings})}}]}
+                json.dumps({"status": "held" if len(calls) == 1 else "complete",
+                            "reason": "", "findings": findings})}}]}
             return response
 
         with tempfile.TemporaryDirectory() as tmp, patch("run_daily.requests.post", side_effect=respond):

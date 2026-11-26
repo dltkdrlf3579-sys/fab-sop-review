@@ -4,12 +4,16 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import date
+from email.utils import parsedate_to_datetime
+import heapq
 import hashlib
+from itertools import count
 import json
 from pathlib import Path
+from random import uniform
 import sys
 from threading import Event, Thread
-from time import monotonic
+from time import monotonic, sleep, time
 from uuid import uuid4
 
 import requests
@@ -63,6 +67,32 @@ def load_llm_settings(config, base):
     return settings
 
 
+class RetryableReviewError(ValueError):
+    def __init__(self, message, retry_after=0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class HeldReview(ValueError):
+    """The model explicitly requires human judgement."""
+
+
+def retry_after_seconds(header):
+    if not header:
+        return 0
+    try:
+        if header.isascii() and header.isdigit():
+            return int(header)
+        return max(0, parsedate_to_datetime(header).timestamp() - time())
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0
+
+
+def retry_delay(attempt, minimum):
+    ceiling = min(300, 10 * 2 ** min(attempt, 5))
+    return max(minimum, uniform(ceiling / 2, ceiling))
+
+
 def request_review(settings, prompt, payload):
     section = settings["llm"]
     url = section.get("base_url", "").strip().rstrip("/")
@@ -85,26 +115,40 @@ def request_review(settings, prompt, payload):
         if max_tokens < 1:
             raise ValueError("[llm] max_tokens는 양의 정수여야 합니다.")
         body["max_tokens"] = max_tokens
-    response = requests.post(url, headers=headers, timeout=section.getfloat("timeout_seconds", 180),
-                             allow_redirects=False, json=body)
+    try:
+        response = requests.post(url, headers=headers, timeout=section.getfloat("timeout_seconds", 180),
+                                 allow_redirects=False, json=body)
+    except requests.exceptions.SSLError:
+        raise
+    except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as exc:
+        raise RetryableReviewError(str(exc)) from exc
     if response.status_code != 200:
-        raise ValueError(f"사내 AI 응답 HTTP {response.status_code}")
-    choice = response.json()["choices"][0]
-    if not isinstance(choice, dict):
-        raise ValueError("사내 AI 응답 형식 오류")
-    if choice.get("finish_reason") not in ("stop", None):
-        raise ValueError("사내 AI 응답 미완료")
-    return json.loads(choice["message"]["content"])
+        message = f"사내 AI 응답 HTTP {response.status_code}"
+        if response.status_code in (408, 425, 429) or 500 <= response.status_code <= 599:
+            raise RetryableReviewError(message, retry_after_seconds(response.headers.get("Retry-After")))
+        raise ValueError(message)
+    try:
+        choice = response.json()["choices"][0]
+        reason = choice.get("finish_reason")
+        if reason == "content_filter":
+            raise HeldReview("사내 AI 응답 필터에 의해 보류")
+        if reason not in ("stop", None):
+            raise RetryableReviewError(f"사내 AI 응답 미완료 ({reason})")
+        return json.loads(choice["message"]["content"])
+    except (HeldReview, RetryableReviewError):
+        raise
+    except (AttributeError, ValueError, TypeError, IndexError, KeyError) as exc:
+        raise RetryableReviewError("사내 AI 응답 형식 오류") from exc
 
 
 def validate(result, rows, evidence):
     if not isinstance(result, dict) or result.get("status") not in ("complete", "held"):
         raise ValueError("검토 상태 누락")
+    if result["status"] == "held":
+        raise HeldReview("AI 판단 보류: " + str(result.get("reason", ""))[:200])
     findings = result.get("findings")
     if not isinstance(findings, list):
         raise ValueError("검토 배열 누락")
-    if result["status"] == "held":
-        raise ValueError("AI 판단 보류: " + str(result.get("reason", ""))[:200])
     sources = {record["ref"]: record for record in evidence}
     checked = []
     for item in findings:
@@ -138,11 +182,28 @@ class DocumentReview:
 ROW_ERRORS = (ValueError, KeyError, TypeError, IndexError, requests.RequestException)
 
 
+@dataclass
+class RowRequest:
+    doc: DocumentReview
+    step: int
+    evidence: list
+    retries: int = 0
+
+    def payload(self):
+        numbered = [dict(row, step=i) for i, row in enumerate(self.doc.rows, 1)]
+        return encode({"rows": numbered, "target_step": self.step, "evidence": self.evidence})
+
+
 def review_step(config, prompt, payload, rows, step, evidence):
     result = request_review(config, prompt, payload)
-    findings = validate(result, rows, evidence)
+    try:
+        findings = validate(result, rows, evidence)
+    except HeldReview:
+        raise
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise RetryableReviewError(str(exc)) from exc
     if any(finding[0] != step for finding in findings):
-        raise ValueError("AI가 대상과 다른 작업행을 지적했습니다.")
+        raise RetryableReviewError("AI가 대상과 다른 작업행을 지적했습니다.")
     return findings
 
 
@@ -154,12 +215,19 @@ def run_reviews(documents, store, config, base, counts):
     workers = settings.getint("max_concurrent_requests", fallback=50)
     if not 1 <= workers <= 50:
         raise ValueError("max_concurrent_requests는 1~50 사이여야 합니다.")
+    retry_workers = settings.getint("max_retry_workers", fallback=10)
+    if not 1 <= retry_workers <= 10:
+        raise ValueError("max_retry_workers는 1~10 사이여야 합니다.")
     evidence_limit = min(20, settings.getint("max_evidence_items", fallback=20))
     char_limit = settings.getint("max_input_chars")
     total = len(documents)
     search = None
     pending = {}
-    print(f"행별 검토 | 배치 동시 호출 최대 {workers}개 | 행당 근거 최대 {evidence_limit}개", flush=True)
+    retry_queue = []
+    retry_order = count()
+    retry_active = 0
+    print(f"행별 검토 | 신규 {workers}개 + 재시도 {retry_workers}개 | 행당 근거 최대 {evidence_limit}개",
+          flush=True)
 
     def report(label, status, detail=""):
         counts[status] += 1
@@ -186,26 +254,54 @@ def run_reviews(documents, store, config, base, counts):
         print(f"{doc.label} | 작업행 {step} 보류 | {error}", file=sys.stderr, flush=True)
         check_progress(doc)
 
-    def collect():
-        while True:
-            finished, _ = wait(pending, timeout=15, return_when=FIRST_COMPLETED)
-            if finished:
-                break
-            elapsed = int(monotonic() - min(start for _, _, start, _ in pending.values()))
-            print(f"AI 응답 대기 | 진행 중 {len(pending)}행 | 가장 오래된 요청 경과 {elapsed}초", flush=True)
+    def submit(executor, job, payload):
+        future = executor.submit(review_step, llm, prompt, payload, job.doc.rows, job.step, job.evidence)
+        pending[future] = (job, monotonic())
+
+    def collect(block):
+        nonlocal retry_active
+        while retry_queue and retry_active < retry_workers and retry_queue[0][0] <= monotonic():
+            _, _, job = heapq.heappop(retry_queue)
+            job.retries += 1
+            submit(retry_pool, job, job.payload())
+            retry_active += 1
+            print(f"{job.doc.label} | 작업행 {job.step} 재시도 {job.retries}회 시작", flush=True)
+        timeout = 15 if block else 0
+        if retry_queue and retry_active < retry_workers:
+            timeout = min(timeout, max(0, retry_queue[0][0] - monotonic()))
+        if pending:
+            finished, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+        else:
+            finished = set()
+            if timeout:
+                sleep(timeout)
+        if not finished and timeout == 15:
+            earliest = min((start for _, start in pending.values()), default=monotonic())
+            print(f"AI 응답 대기 | 신규 {len(pending)-retry_active}행 | 재시도 중 {retry_active}행 "
+                  f"| 재시도 대기 {len(retry_queue)}행 | 최장 경과 {int(monotonic()-earliest)}초", flush=True)
         for future in finished:
-            doc, step, _, candidates = pending.pop(future)
+            job, _ = pending.pop(future)
+            doc, step = job.doc, job.step
+            if job.retries:
+                retry_active -= 1
             try:
                 findings = future.result()
+            except RetryableReviewError as exc:
+                delay = retry_delay(job.retries, exc.retry_after)
+                heapq.heappush(retry_queue, (monotonic() + delay, next(retry_order), job))
+                print(f"{doc.label} | 작업행 {step} 재시도 대기 ({delay:.0f}초 후) | {exc}", flush=True)
             except ROW_ERRORS as exc:
                 hold_row(doc, step, exc)
             else:
+                candidates = [{"rank": rank, "id": entry["id"], "source": entry["source"],
+                               "page": entry.get("page")} for rank, entry in enumerate(job.evidence, 1)]
                 result = {"findings": findings, "candidates": candidates}
                 doc.results[step] = store.save_step(doc.sop, doc.key, step, result)
                 check_progress(doc)
 
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        with (ThreadPoolExecutor(max_workers=workers, thread_name_prefix="first") as pool,
+              ThreadPoolExecutor(max_workers=retry_workers, thread_name_prefix="retry") as retry_pool):
             for number, ((sop_id, rev), rows) in enumerate(documents.items(), 1):
                 sop = str(sop_id)
                 revision = "" if rev is None else str(rev)
@@ -240,25 +336,24 @@ def run_reviews(documents, store, config, base, counts):
                 for step, row in enumerate(rows, 1):
                     if step in resumed:
                         continue
-                    if len(pending) >= workers:
-                        collect()
+                    collect(False)
+                    while len(pending) - retry_active >= workers:
+                        collect(True)
                     evidence = search.evidence(row)
                     if not evidence:
                         hold_row(doc, step, "작업 내용과 일치하는 규정 근거를 찾지 못했습니다.")
                         continue
-                    payload = encode({"rows": numbered, "target_step": step, "evidence": evidence})
+                    job = RowRequest(doc, step, evidence)
+                    payload = job.payload()
                     size = len(prompt) + len(payload)
                     if size > char_limit:
                         hold_row(doc, step, f"입력 길이 설정 초과 (입력 {size:,}자 / 설정 {char_limit:,}자)")
                         continue
-                    future = pool.submit(review_step, llm, prompt, payload, rows, step, evidence)
-                    candidates = [{"rank": rank, "id": entry["id"], "source": entry["source"],
-                                   "page": entry.get("page")} for rank, entry in enumerate(evidence, 1)]
-                    pending[future] = (doc, step, monotonic(), candidates)
+                    submit(pool, job, payload)
                     print(f"{label} | AI 응답 대기 | 작업행 {step}/{len(rows)} "
                           f"(근거 {len(evidence)}개, 입력 {size:,}자)", flush=True)
-            while pending:
-                collect()
+            while pending or retry_queue:
+                collect(True)
     finally:
         if search is not None:
             search.db.close()
