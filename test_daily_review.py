@@ -7,15 +7,47 @@ import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
 
-from run_daily import HERE, load_llm_settings, main, request_review
+from run_daily import HERE, load_llm_settings, main, request_review, waiting
 from notifications import deliver_pending
 from fab_batch import read_config
 from result_store import ReviewStore, relation
 
 
 class DailyReviewTest(unittest.TestCase):
+    def test_waiting_reports_until_stage_ends(self):
+        reported = Event()
+        with patch("builtins.print", side_effect=lambda line, **kw: reported.set() if "경과" in line else None) as log:
+            with waiting("시험 단계", interval=0.01):
+                self.assertTrue(reported.wait(2))
+            self.assertTrue(all(call.kwargs["flush"] for call in log.call_args_list))
+
+    def test_batch_progress_counts_saved_reused_and_held(self):
+        rows = [{"SOP제목": "연습", "주작업명": "준비", "주작업순번": "1",
+                 "하위작업순번": "1", "하위작업내용": "준비 항목 확인"}]
+        docs = {(key, "1"): rows for key in ("A", "B", "C")}
+        cfg = read_config(HERE / "config.example.ini")
+        cfg["llm"]["model_name"] = "fixture"
+        output = StringIO()
+        with (patch.object(sys, "argv", ["run_daily"]), patch("run_daily.read_config", return_value=cfg),
+              patch("run_daily.load_fab_sops", return_value=docs), patch("run_daily.load_sql_adapter"),
+              patch("run_daily.ReviewStore") as store, patch("run_daily.RegulationSearch") as search,
+              patch("run_daily.request_review", return_value={"status": "complete", "findings": []}) as api,
+              redirect_stdout(output), redirect_stderr(output)):
+            store.return_value.is_current.side_effect = [False, True, False]
+            store.return_value.save.return_value = "검토 완료"
+            search.return_value.evidence.side_effect = [[], [{"text": "x" * 160000}]]
+            self.assertEqual(main(), 1)
+            api.assert_called_once()
+        lines = output.getvalue()
+        self.assertIn("[1/3] SOP A | AI 응답 대기", lines)
+        self.assertIn("[2/3] SOP B | 재사용", lines)
+        self.assertIn("[3/3] SOP C | 검토 미완료", lines)
+        self.assertIn("설정 160,000자", lines)
+        self.assertIn("전체 3건 | 검토 완료 1건 | 재사용 1건 | 검토 미완료 1건", lines)
+
     def test_inline_and_external_llm_settings(self):
         cfg = read_config(HERE / "config.example.ini")
         cfg["llm"].update({"base_url": "https://inline.invalid/v1", "model_name": "local",

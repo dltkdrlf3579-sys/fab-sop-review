@@ -1,11 +1,13 @@
 """FAB SOP daily review. Write completed reviews to the configured internal result table."""
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import date
 import hashlib
 import json
 from pathlib import Path
 import sys
+from threading import Event, Thread
+from time import monotonic
 from uuid import uuid4
 
 import requests
@@ -16,6 +18,25 @@ from notifications import deliver_pending
 from result_store import ReviewStore
 
 HERE = Path(__file__).resolve().parent
+
+
+@contextmanager
+def waiting(label, interval=15):
+    print(label, flush=True)
+    started = monotonic()
+    finished = Event()
+
+    def report_wait():
+        while not finished.wait(interval):
+            print(f"{label} | 경과 {int(monotonic() - started)}초", flush=True)
+
+    reporter = Thread(target=report_wait, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        reporter.join()
 
 
 def encode(value):
@@ -93,19 +114,24 @@ def validate(result, rows, evidence):
     return checked
 
 
-def review_one(store, sop, revision, digest, rows, search, prompt, llm_config, limit):
+def review_one(store, sop, revision, digest, rows, search, prompt, llm_config, limit, label):
     problems = input_notes(rows)
     if problems:
         raise ValueError("입력 확인: " + " ".join(problems))
-    evidence = search.evidence(rows)
+    with waiting(f"{label} | 규정 검색 중 (작업 {len(rows)}행)"):
+        evidence = search.evidence(rows)
     payload = encode({"rows": [dict(row, step=i) for i, row in enumerate(rows, 1)],
                       "evidence": evidence})
-    if len(prompt) + len(payload) > limit:
-        raise ValueError("입력 길이 설정 초과. 원문을 생략하지 않고 보류합니다.")
-    findings = validate(request_review(llm_config, prompt, payload), rows, evidence)
+    size = len(prompt) + len(payload)
+    if size > limit:
+        raise ValueError(f"입력 길이 설정 초과 (입력 {size:,}자 / 설정 {limit:,}자). 원문을 생략하지 않고 보류합니다.")
+    with waiting(f"{label} | AI 응답 대기 (입력 {size:,}자)"):
+        response = request_review(llm_config, prompt, payload)
+    findings = validate(response, rows, evidence)
     model = llm_config["llm"].get("model_name") or llm_config["llm"]["model"]
-    return store.save(sop, revision, digest, rows, findings, search.index_hash,
-                      hashlib.sha256(prompt.encode()).hexdigest(), model)
+    with waiting(f"{label} | DB 저장 중"):
+        return store.save(sop, revision, digest, rows, findings, search.index_hash,
+                          hashlib.sha256(prompt.encode()).hexdigest(), model)
 
 
 def main():
@@ -114,43 +140,59 @@ def main():
     parser.add_argument("--as-of", type=date.fromisoformat, help="한국 기준 조회 마지막 날짜 YYYY-MM-DD")
     args = parser.parse_args()
     config = read_config(args.config)
-    documents = load_fab_sops(args.config, args.as_of)
-    if not documents:
-        print("조회 대상 0건")
+    with waiting("FAB SOP 조회 중"):
+        documents = load_fab_sops(args.config, args.as_of)
+    total = len(documents)
+    print(f"조회 완료 | 검토 대상 {total}건", flush=True)
     settings = config["review"]
     base = args.config.resolve().parent
     if not config.has_section("daily_review"):
         parser.error("config.ini의 [daily_review]에 result_history_table을 지정하세요.")
     output = config["daily_review"]
     adapter = load_sql_adapter(args.config, config)
-    errors = 0
+    counts = {"검토 완료": 0, "재사용": 0, "검토 미완료": 0}
     search = None
-    with closing(adapter.iqadb1()) as db:
+    with waiting("결과 DB 연결 중"):
+        connection = adapter.iqadb1()
+    with closing(connection) as db:
         store = ReviewStore(db, output)
-        store.prepare(output.getboolean("auto_create_result_table", True))
+        with waiting("결과 테이블 확인 중"):
+            store.prepare(output.getboolean("auto_create_result_table", True))
         try:
-            for key, rows in documents.items():
+            for number, (key, rows) in enumerate(documents.items(), 1):
+                label = f"[{number}/{total}] SOP {key[0]}"
+                detail = ""
                 try:
                     sop = str(key[0])
                     revision = "" if key[1] is None else str(key[1])
                     digest = content_hash(rows)
-                    if store.is_current(sop, revision, digest):
-                        print(key[0], "재사용")
-                        continue
-                    if search is None:
-                        llm = load_llm_settings(config, base)
-                        prompt = (HERE / "review_prompt.txt").read_text(encoding="utf-8")
-                        search = RegulationSearch(base / settings["index_path"], settings["guide_source"], settings["guide_sheet"])
-                    print(key[0], review_one(store, sop, revision, digest, rows, search, prompt, llm,
-                                             settings.getint("max_input_chars")))
+                    with waiting(f"{label} | 기존 검토 조회 중"):
+                        current = store.is_current(sop, revision, digest)
+                    if current:
+                        status = "재사용"
+                    else:
+                        if search is None:
+                            llm = load_llm_settings(config, base)
+                            prompt = (HERE / "review_prompt.txt").read_text(encoding="utf-8")
+                            with waiting(f"{label} | 규정 색인 로딩 중"):
+                                search = RegulationSearch(base / settings["index_path"], settings["guide_source"], settings["guide_sheet"])
+                        status = review_one(store, sop, revision, digest, rows, search, prompt, llm,
+                                            settings.getint("max_input_chars"), label)
                 except (ValueError, KeyError, TypeError, IndexError, requests.RequestException) as exc:
-                    errors += 1
-                    print(key[0], "검토 미완료", str(exc), file=sys.stderr)
-            deliver_pending(store, config)
+                    status = "검토 미완료"
+                    detail = f" | {exc}"
+                counts[status] += 1
+                print(f"{label} | {status}{detail} | 처리율 {number/total:.1%}",
+                      file=sys.stderr if detail else sys.stdout, flush=True)
+            if config.getboolean("mail", "enabled", fallback=False):
+                with waiting("대기 메일 처리 중"):
+                    deliver_pending(store, config)
         finally:
             if search is not None:
                 search.db.close()
-    return 1 if errors else 0
+    summary = " | ".join(f"{name} {count}건" for name, count in counts.items())
+    print(f"배치 종료 | 전체 {total}건 | {summary}", flush=True)
+    return 1 if counts["검토 미완료"] else 0
 
 
 if __name__ == "__main__":
