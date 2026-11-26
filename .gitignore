@@ -1,0 +1,15 @@
+# Only the distributable batch files belong in source control.
+/*
+!/.gitignore
+!/README.md
+!/config.example.ini
+!/fab_batch.py
+!/notifications.py
+!/regulation_search.py
+!/result_store.py
+!/run_daily.py
+!/run_daily.bat
+!/register_daily.ps1
+!/review_prompt.txt
+!/test_fab_batch.py
+!/test_daily_review.py
