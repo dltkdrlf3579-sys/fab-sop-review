@@ -7,10 +7,10 @@ import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import Mock, patch
 
-from run_daily import HERE, load_llm_settings, main, request_review, waiting
+from run_daily import HERE, load_llm_settings, main, request_review, run_reviews, waiting
 from notifications import deliver_pending
 from regulation_search import RegulationSearch
 from fab_batch import read_config
@@ -29,18 +29,19 @@ class DailyReviewTest(unittest.TestCase):
             return {"SOP제목": "", "주작업명": "", "하위작업내용": term}
         records = [item("other-guide", "gamma"), item("matched-guide", "alpha"),
                    item("matched-rule", "beta", rule=True)]
-        records.extend(item(str(i), "alpha", rule=True) for i in range(12))
+        records.extend(item(str(i), "alpha", rule=True) for i in range(32))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fixture.jsonl"
             path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
             search = RegulationSearch(path, "fixture", "FAB", 2)
             self.addCleanup(search.db.close)
-            result = search.evidence([step("alpha"), step("alpha"), step("beta")])
-            self.assertEqual([r["id"] for r in result], ["matched-guide", "matched-rule"])
-            self.assertEqual(search.evidence([step("absent")]), [])
+            self.assertEqual(len(search.evidence(step("alpha"))), 2)
+            self.assertEqual(search.evidence(step("alpha"))[0]["id"], "matched-guide")
+            self.assertEqual([r["id"] for r in search.evidence(step("beta"))], ["matched-rule"])
+            self.assertEqual(search.evidence(step("absent")), [])
             default_search = RegulationSearch(path, "fixture", "FAB")
             self.addCleanup(default_search.db.close)
-            self.assertEqual(len(default_search.evidence([step("alpha")])), 8)
+            self.assertEqual(len(default_search.evidence(step("alpha"))), 20)
 
     def test_waiting_reports_until_stage_ends(self):
         reported = Event()
@@ -62,6 +63,9 @@ class DailyReviewTest(unittest.TestCase):
               patch("run_daily.request_review", return_value={"status": "complete", "findings": []}) as api,
               redirect_stdout(output), redirect_stderr(output)):
             store.return_value.is_current.side_effect = [False, True, False]
+            store.return_value.load_steps.side_effect = lambda *args: {}
+            search.return_value.index_hash = "idx"
+            store.return_value.save_step.side_effect = lambda sop, key, step, findings: findings
             store.return_value.save.return_value = "검토 완료"
             search.return_value.evidence.side_effect = [[{"ref": "E1", "text": "근거"}], [{"text": "x" * 160000}]]
             self.assertEqual(main(), 1)
@@ -72,6 +76,71 @@ class DailyReviewTest(unittest.TestCase):
         self.assertIn("[3/3] SOP C | 검토 미완료", lines)
         self.assertIn("설정 160,000자", lines)
         self.assertIn("전체 3건 | 검토 완료 1건 | 재사용 1건 | 검토 미완료 1건", lines)
+
+    def test_parallel_pool_spans_sops_and_only_failed_target_is_retried(self):
+        docs = {(sop, "1"): [
+            {"SOP제목": sop, "주작업명": "work", "주작업순번": "1",
+             "하위작업순번": str(i), "하위작업내용": f"{sop}-{i}"} for i in range(1, 31)
+        ] for sop in ("A", "B")}
+        cfg = read_config(HERE / "config.example.ini")
+        cfg["llm"]["model_name"] = "fixture"
+        store = Mock()
+        checkpoints = {}
+        completed = set()
+        def save_step(sop, key, step, findings):
+            checkpoints.setdefault((sop, key), {})[step] = findings
+            return findings
+        def save(sop, *args):
+            completed.add(sop)
+            return "검토 완료"
+        store.save.side_effect = save
+        store.is_current.side_effect = lambda sop, *args: sop in completed
+        store.load_steps.side_effect = lambda sop, key: dict(checkpoints.get((sop, key), {}))
+        store.save_step.side_effect = save_step
+        search = Mock(index_hash="idx")
+        search.evidence.side_effect = lambda row: [{"ref": "E1", "text": row["하위작업내용"],
+                                                    "id": "1", "source": "fixture", "page": 1}]
+        hits = []
+        active = peak = 0
+        lock, full = Lock(), Event()
+        def respond(cfg, prompt, payload):
+            nonlocal active, peak
+            body = json.loads(payload)
+            step, rows = body["target_step"], body["rows"]
+            sop = rows[0]["SOP제목"]
+            self.assertEqual(len(rows), 30)
+            self.assertEqual(body["evidence"][0]["text"], rows[step-1]["하위작업내용"])
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                hits.append((sop, step))
+                if active == 50:
+                    full.set()
+            try:
+                self.assertTrue(full.wait(10))
+                if (sop, step) == ("B", 30) and hits.count(("B", 30)) == 1:
+                    return {"status": "complete", "findings": [{"step": 1, "kind": "확인 요청",
+                            "message": "확인해 주세요.", "ref": "E1", "quote": "B-30"}]}
+                return {"status": "complete", "findings": []}
+            finally:
+                with lock:
+                    active -= 1
+        def run():
+            counts = dict.fromkeys(("검토 완료", "검토 미완료", "재사용"), 0)
+            run_reviews(docs, store, cfg, HERE, counts)
+            return counts
+        with (patch("run_daily.RegulationSearch", return_value=search),
+              patch("run_daily.request_review", side_effect=respond),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(run(), {"검토 완료": 1, "검토 미완료": 1, "재사용": 0})
+            self.assertEqual(completed, {"A"})
+            self.assertEqual(len(hits), 60)
+            self.assertEqual(peak, 50)
+            self.assertEqual(run(), {"검토 완료": 1, "검토 미완료": 0, "재사용": 1})
+            self.assertEqual(hits[60:], [("B", 30)])
+            cfg["review"]["max_concurrent_requests"] = "51"
+            with self.assertRaises(ValueError):
+                run()
 
     def test_inline_and_external_llm_settings(self):
         cfg = read_config(HERE / "config.example.ini")

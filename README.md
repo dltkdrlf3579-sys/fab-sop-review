@@ -8,14 +8,14 @@ Python 3.10 이상, pandas, requests, SQLite FTS5 및 작업중지권의 Postgre
 1. 검증된 `knowledge_index.jsonl`을 사내에 두고 `[review] index_path`로 지정합니다.
 2. `[fab] query`의 예시 뷰를 실제 FAB SOP 조회문으로 바꿉니다. 각 작업행에는 해당 개정본의 최초등록시각 `CRE_DTTM`이 같은 값으로 들어가야 합니다. 한국 현지 시각을 사용하고 시·분·초와 소수초 정밀도를 유지하세요. 같은 SOP의 서로 다른 버전에 등록시각이 같은 경우에는 실제 개정번호를 SELECT에 추가하고 `revision_column`에 지정하세요.
 3. `[data] adapter_dir`에 작업중지권의 sql_adapter.py 폴더를, 필요하면 `driver_dir`에 사내 DB 드라이버 폴더를 지정합니다.
-4. `[daily_review] result_history_table`에 SOP 결과 전용 테이블명을 지정합니다. 예를 들어 `ehs.ai_fab_sop_review`를 쓰면 첫 실행 시 그 테이블과 `ehs.ai_fab_sop_review_latest` 뷰가 생성됩니다. 스키마는 이미 존재해야 하고 실행 계정에 생성·읽기·쓰기 권한이 필요합니다. 관리자가 두 객체를 미리 만들었으면 `auto_create_result_table = false`를 사용할 수 있습니다. 기존 SQLite 시험 데이터는 별도로 남습니다.
+4. `[daily_review] result_history_table`에 SOP 결과 전용 테이블명을 지정합니다. 예를 들어 `ehs.ai_fab_sop_review`를 쓰면 첫 실행 시 그 테이블과 `ehs.ai_fab_sop_review_latest` 뷰가 생성됩니다. 스키마는 이미 존재해야 하고 실행 계정에 생성·읽기·쓰기 권한이 필요합니다. 작업행 중간결과는 같은 스키마의 `<테이블명>_steps`에 저장합니다. 이름을 바꾸려면 `step_work_table`에 지정합니다. 관리자가 세 객체를 미리 만들었으면 `auto_create_result_table = false`를 사용할 수 있습니다. 기존 SQLite 시험 데이터는 별도로 남습니다.
 5. 회사 PC의 `config.ini`에서 `[review] llm_config`를 비우고, 작업중지권의 `[llm]`에서 `base_url`, `model_name`, `x_dep_ticket`, `send_system_name`, `user_id`, `user_type` 값을 같은 이름으로 복사합니다. 기존 설정 파일을 계속 공유하려면 `llm_config`에 그 파일 경로를 지정하세요. 경로가 있으면 해당 파일의 `[llm]` 전체를 사용합니다. 인증값은 회사 PC의 실제 설정에만 입력하세요.
 
 모델 요청은 OpenAI 호환 chat/completions를 사용합니다. `[llm] api_key`는 별도 Bearer 키를 쓰는 경우에 설정합니다. `max_tokens`는 응답 생성 한도이며 비워 두면 서버의 기본값을 사용합니다. `[review] max_input_chars`는 모델 호출 전 입력 **문자 수** 제한입니다.
 
 `python fab_batch.py --show-sop 001`로 자료를 확인하고 `run_daily.bat`로 검토합니다. 과거 날짜 재실행은 `run_daily.bat --as-of 2026-11-26`입니다. 기준일 포함 최근 3일이 기본이며 `lookback_days`로 조정합니다. 시작일 이상·다음날 미만에 최초 등록된 각 개정본의 작업행 전체를 조회합니다.
 
-SOP 번호·개정·본문이 같으면 저장한 판정을 재사용합니다. 소스가 개정번호를 제공하지 않으면 본문 해시로 구별합니다. FAB 가이드도 규정과 함께 BM25로 검색합니다. 제목·주작업명·하위작업내용으로 작업행당 상위 8개를 찾은 뒤, 전체 작업행의 1순위부터 순서대로 모아 중복을 제거합니다. 모델에는 SOP 작업행 전체와 선별된 근거만 전달합니다. SOP당 근거 상한은 `[review] max_evidence_items`이며, 생략하면 20개입니다. 검색 결과가 0개면 해당 검토는 보류합니다. 실제 사내 규정이 바뀌어 전면 재검토할 경우 `result_history_table`에 새 테이블명을 지정해 이력을 분리할 수 있습니다. 입력 또는 API 오류가 난 문서는 완료로 저장하지 않습니다. 실행일을 넘겨 재시도할 때는 해당 날짜의 `--as-of`를 지정할 수 있습니다.
+SOP 번호·개정·본문이 같으면 저장한 판정을 재사용합니다. 소스가 개정번호를 제공하지 않으면 본문 해시로 구별합니다. FAB 가이드도 규정과 함께 BM25로 검색합니다. 작업행마다 제목·주작업명·하위작업내용으로 근거를 최대 20개 검색합니다. 각 AI 요청에 SOP 전체 원문과 대상 행 번호, 그 행에서 찾은 근거를 함께 보냅니다. `[review] max_concurrent_requests`는 배치 한 번에 여러 SOP가 공유하는 동시 호출 수이며 기본 50, 허용 범위 1~50입니다. 한 PC에서 배치를 두 번 실행하면 각각의 한도가 적용됩니다. `max_evidence_items`로 행당 근거 수를 줄일 수 있습니다. 이전 설정에 20보다 큰 값이 있으면 20을 적용합니다. 근거 없음, 다른 행 지적, 잘못된 인용 또는 시간 초과가 발생한 행은 보류합니다. 검증된 행은 중간결과로 저장하고 동일 입력으로 다음 실행 시 남은 행만 검토합니다. 모든 행이 성공해야 한 건의 검토 이력과 메일 상태가 게시됩니다. 실제 사내 규정이 바뀌어 전면 재검토할 경우 `result_history_table`에 새 테이블명을 지정해 이력을 분리할 수 있습니다. 입력 또는 API 오류가 난 문서는 완료로 저장하지 않습니다. 실행일을 넘겨 재시도할 때는 해당 날짜의 `--as-of`를 지정할 수 있습니다.
 
 설정한 결과 테이블에는 검토 이력이 누적됩니다. `<테이블명>_latest` 뷰는 SOP 개정본별 마지막 완료 회차의 모든 작업행을 반환합니다. 작업명과 작업내용 옆에 의견 유형(`kind`), 보완의견(`message`), 근거 문서(`source`), 원문 인용(`quote`)이 붙습니다. 한 단계에 의견이 두 건이면 두 행, 의견이 없으면 의견란이 빈 한 행입니다.
 

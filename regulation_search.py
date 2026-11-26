@@ -1,7 +1,6 @@
 """Local BM25 search over reviewed text from the portable JSONL index."""
 from collections import Counter
 import hashlib
-from itertools import zip_longest
 import json
 from pathlib import Path
 import re
@@ -49,23 +48,14 @@ class RegulationSearch:
             self.db.close()
             raise ValueError("색인에서 설정한 FAB 가이드 시트의 구조화 행을 찾지 못했습니다.")
 
-    def evidence(self, rows):
-        ranked_steps = []
-        for row in rows:
-            query = " ".join(row[key] for key in ("SOP제목", "주작업명", "하위작업내용"))
-            keywords = [word for word, _ in Counter(terms(query)).most_common(100)]
-            if not keywords:
-                continue
-            expression = " OR ".join(f'"{word}"' for word in keywords)
-            hits = self.db.execute("SELECT rowid FROM search WHERE search MATCH ? ORDER BY rank, rowid LIMIT 8",
-                                   (expression,))
-            ranked_steps.append([num for (num,) in hits])
-        selected = {}
-        for rank in zip_longest(*ranked_steps):
-            for num in rank:
-                if num is None:
-                    continue
-                selected[num] = None
-                if len(selected) == self.max_evidence_items:
-                    return [self.records[n] for n in selected]
-        return [self.records[num] for num in selected]
+    def evidence(self, row):
+        query = " ".join(row[key] for key in ("SOP제목", "주작업명", "하위작업내용"))
+        keywords = [word for word, _ in Counter(terms(query)).most_common(100)]
+        if not keywords:
+            return []
+        expression = " OR ".join(f'"{word}"' for word in keywords)
+        hits = self.db.execute(
+            "SELECT rowid FROM search WHERE search MATCH ? ORDER BY rank, rowid LIMIT ?",
+            (expression, self.max_evidence_items),
+        )
+        return [self.records[num] for (num,) in hits]

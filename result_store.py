@@ -1,6 +1,7 @@
 """FAB review history in the same PostgreSQL-compatible DB as the source adapter."""
 from collections import defaultdict
 from contextlib import contextmanager
+import json
 import re
 from uuid import uuid4
 
@@ -19,7 +20,8 @@ class ReviewStore:
         name = settings["result_history_table"].strip()
         self.table = relation(name)
         self.view = relation(settings.get("latest_view", "").strip() or name + "_latest")
-        if self.table == self.view:
+        self.work = relation(settings.get("step_work_table", "").strip() or name + "_steps")
+        if len({self.work, self.table, self.view}) != 3:
             raise ValueError("결과 테이블과 최신 뷰는 이름이 달라야 합니다.")
 
     @contextmanager
@@ -47,6 +49,9 @@ class ReviewStore:
                     kind TEXT, message TEXT, evidence_id TEXT, source TEXT, page TEXT, quote TEXT,
                     mail_state TEXT, mail_subject TEXT, mail_body TEXT,
                     PRIMARY KEY(sopr_no, review_id, step, finding_no)){distribution}""")
+                cur.execute(f"""CREATE TABLE IF NOT EXISTS {self.work} (
+                    sopr_no TEXT NOT NULL, work_key TEXT NOT NULL, step INTEGER NOT NULL,
+                    findings TEXT NOT NULL, PRIMARY KEY(sopr_no, work_key, step)){distribution}""")
                 cur.execute("SELECT to_regclass(%s)", (self.view,))
                 if cur.fetchone()[0] is None:
                     cur.execute(f"""CREATE VIEW {self.view} AS
@@ -60,6 +65,25 @@ class ReviewStore:
                         ) latest USING (sopr_no, revision, review_id)""")
             for name in (self.table, self.view):
                 cur.execute(f"SELECT review_id, content_hash, mail_state FROM {name} LIMIT 0")
+            cur.execute(f"SELECT sopr_no, work_key, step, findings FROM {self.work} LIMIT 0")
+
+    def load_steps(self, sop, key):
+        with self.transaction() as cur:
+            cur.execute(f"SELECT step, findings FROM {self.work} WHERE sopr_no=%s AND work_key=%s",
+                        (sop, key))
+            return {step: json.loads(data) for step, data in cur.fetchall()}
+
+    def save_step(self, sop, key, step, findings):
+        with self.transaction() as cur:
+            cur.execute(f"LOCK TABLE {self.work} IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(f"SELECT findings FROM {self.work} WHERE sopr_no=%s AND work_key=%s AND step=%s",
+                        (sop, key, step))
+            existing = cur.fetchone()
+            if existing:
+                return json.loads(existing[0])
+            cur.execute(f"INSERT INTO {self.work} (sopr_no, work_key, step, findings) VALUES (%s,%s,%s,%s)",
+                        (sop, key, step, json.dumps(findings, ensure_ascii=False)))
+        return findings
 
     def _is_current(self, cur, sop, revision, digest):
         cur.execute(f"SELECT content_hash FROM {self.table} WHERE sopr_no=%s AND revision=%s "
@@ -71,7 +95,7 @@ class ReviewStore:
         with self.transaction() as cur:
             return self._is_current(cur, sop, revision, digest)
 
-    def save(self, sop, revision, digest, rows, findings, index_hash, prompt_hash, model):
+    def save(self, sop, revision, digest, rows, findings, index_hash, prompt_hash, model, work_key=None):
         by_step = defaultdict(list)
         lines = []
         for step, kind, message, evidence_id, source, page, quote in findings:
@@ -84,6 +108,8 @@ class ReviewStore:
         with self.transaction() as cur:
             # Serialize only the short write. Another worker may have finished during the model call.
             cur.execute(f"LOCK TABLE {self.table} IN SHARE ROW EXCLUSIVE MODE")
+            if work_key is not None:
+                cur.execute(f"DELETE FROM {self.work} WHERE sopr_no=%s AND work_key=%s", (sop, work_key))
             if self._is_current(cur, sop, revision, digest):
                 return "재사용"
             cur.execute("SELECT clock_timestamp()")
