@@ -9,13 +9,39 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from run_daily import HERE, main
+from run_daily import HERE, load_llm_settings, main, request_review
 from notifications import deliver_pending
 from fab_batch import read_config
 from result_store import ReviewStore, relation
 
 
 class DailyReviewTest(unittest.TestCase):
+    def test_inline_and_external_llm_settings(self):
+        cfg = read_config(HERE / "config.example.ini")
+        cfg["llm"].update({"base_url": "https://inline.invalid/v1", "model_name": "local",
+                           "x_dep_ticket": "fixture-ticket", "max_tokens": "1024"})
+        reply = Mock(status_code=200)
+        reply.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+        with tempfile.TemporaryDirectory() as tmp, patch("run_daily.requests.post", return_value=reply) as post:
+            folder = Path(tmp)
+            request_review(load_llm_settings(cfg, folder), "prompt", "rows")
+            args, options = post.call_args
+            self.assertEqual(args, ("https://inline.invalid/v1/chat/completions",))
+            self.assertEqual(options["headers"]["x-dep-ticket"], "fixture-ticket")
+            self.assertEqual(options["json"]["max_tokens"], 1024)
+            cfg["review"]["llm_config"] = "other.ini"
+            (folder / "other.ini").write_text("[llm]\nbase_url=https://other.invalid/v1\nmodel_name=other\n")
+            request_review(load_llm_settings(cfg, folder), "prompt", "rows")
+            args, options = post.call_args
+            self.assertEqual(args, ("https://other.invalid/v1/chat/completions",))
+            self.assertNotIn("x-dep-ticket", options["headers"])
+            self.assertNotIn("max_tokens", options["json"])
+            cfg["review"]["llm_config"] = ""
+            cfg["llm"]["max_tokens"] = "-1"
+            with self.assertRaises(ValueError):
+                request_review(load_llm_settings(cfg, folder), "prompt", "rows")
+            self.assertEqual(post.call_count, 2)
+
     def test_result_names(self):
         self.assertEqual(relation("ehs.FAB_reviews"), '"ehs"."fab_reviews"')
         for name in ("a;b", "", "a..b", "a" * 64):
@@ -63,7 +89,7 @@ class DailyReviewTest(unittest.TestCase):
             sql("CREATE TABLE your_fab_sop_view (sopr_no text,sopr_nm text,sopr_main_seq int,"
                 "sopr_main_nm text,sopr_sub_seq int,sopr_sub_ctnt text,CRE_DTTM timestamp)")
             sql("INSERT INTO your_fab_sop_view VALUES('001','연습',1,'준비',1,'준비한다','2026-11-26')")
-            cfg = (HERE/"config.example.ini").read_text(encoding="utf-8").replace("../../stopworking/config.ini", "model.ini")
+            cfg = (HERE/"config.example.ini").read_text(encoding="utf-8").replace("llm_config =\n", "llm_config = model.ini\n")
             cfg = cfg.replace("result_history_table = ai_fab_sop_review", f"result_history_table = {schema}.custom_review")
             (folder/"config.ini").write_text(cfg, encoding="utf-8")
             (folder/"model.ini").write_text("[llm]\nbase_url=https://fixture.invalid/v1\nmodel_name=fixture\n")

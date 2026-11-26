@@ -9,7 +9,9 @@ Python 3.10 이상, pandas, requests, SQLite FTS5 및 작업중지권의 Postgre
 2. `[fab] query`의 예시 뷰를 실제 FAB SOP 조회문으로 바꿉니다. 각 작업행에는 해당 개정본의 최초등록시각 `CRE_DTTM`이 같은 값으로 들어가야 합니다. 한국 현지 시각을 사용하고 시·분·초와 소수초 정밀도를 유지하세요. 같은 SOP의 서로 다른 버전에 등록시각이 같은 경우에는 실제 개정번호를 SELECT에 추가하고 `revision_column`에 지정하세요.
 3. `[data] adapter_dir`에 작업중지권의 sql_adapter.py 폴더를, 필요하면 `driver_dir`에 사내 DB 드라이버 폴더를 지정합니다.
 4. `[daily_review] result_history_table`에 SOP 결과 전용 테이블명을 지정합니다. 예를 들어 `ehs.ai_fab_sop_review`를 쓰면 첫 실행 시 그 테이블과 `ehs.ai_fab_sop_review_latest` 뷰가 생성됩니다. 스키마는 이미 존재해야 하고 실행 계정에 생성·읽기·쓰기 권한이 필요합니다. 관리자가 두 객체를 미리 만들었으면 `auto_create_result_table = false`를 사용할 수 있습니다. 기존 SQLite 시험 데이터는 별도로 남습니다.
-5. `[review] llm_config`에 사내 모델 접속 정보가 들어 있는 작업중지권 설정 파일을 지정합니다. 모델은 OpenAI 호환 chat/completions를 사용합니다. SQL, 인증값, 사내 자료와 결과 DB는 외부 공유본에서 제외하세요.
+5. 회사 PC의 `config.ini`에서 `[review] llm_config`를 비우고, 작업중지권의 `[llm]`에서 `base_url`, `model_name`, `x_dep_ticket`, `send_system_name`, `user_id`, `user_type` 값을 같은 이름으로 복사합니다. 기존 설정 파일을 계속 공유하려면 `llm_config`에 그 파일 경로를 지정하세요. 경로가 있으면 해당 파일의 `[llm]` 전체를 사용합니다. 인증값은 회사 PC의 실제 설정에만 입력하세요.
+
+모델 요청은 OpenAI 호환 chat/completions를 사용합니다. `[llm] api_key`는 별도 Bearer 키를 쓰는 경우에 설정합니다. `max_tokens`는 응답 생성 한도이며 비워 두면 서버의 기본값을 사용합니다. `[review] max_input_chars`는 모델 호출 전 입력 **문자 수** 제한입니다.
 
 `python fab_batch.py --show-sop 001`로 자료를 확인하고 `run_daily.bat`로 검토합니다. 과거 날짜 재실행은 `run_daily.bat --as-of 2026-11-26`입니다. 기준일 포함 최근 3일이 기본이며 `lookback_days`로 조정합니다. 시작일 이상·다음날 미만에 최초 등록된 각 개정본의 작업행 전체를 조회합니다.
 

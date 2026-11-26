@@ -29,10 +29,19 @@ def content_hash(rows):
     return hashlib.sha256(encode(values).encode()).hexdigest()
 
 
+def load_llm_settings(config, base):
+    path = config["review"].get("llm_config", "").strip()
+    settings = read_config(base / path) if path else config
+    if not settings.has_section("llm"):
+        raise ValueError("모델 설정 파일에 [llm] 섹션이 필요합니다.")
+    return settings
+
+
 def request_review(settings, prompt, payload):
     section = settings["llm"]
-    url = section["base_url"].strip().rstrip("/")
-    if not url or not section.get("model_name", section.get("model", "")).strip():
+    url = section.get("base_url", "").strip().rstrip("/")
+    model = section.get("model_name") or section.get("model")
+    if not url or not model:
         raise ValueError("사내 AI base_url 및 model_name 설정 필요")
     headers = {"Content-Type": "application/json", "Prompt-Msg-Id": str(uuid4()),
                "Completion-Msg-Id": str(uuid4())}
@@ -40,14 +49,18 @@ def request_review(settings, prompt, payload):
                         ("user_id", "User-Id"), ("user_type", "User-Type")):
         if section.get(key):
             headers[header] = section[key]
-    headers["Authorization"] = "Bearer " + section.get("api_key", "api_key")
+    headers["Authorization"] = "Bearer " + (section.get("api_key") or "api_key")
     if not url.endswith("/chat/completions"):
         url += "/chat/completions"
-    model = section.get("model_name") or section["model"]
+    body = {"model": model, "temperature": 0,
+            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": payload}]}
+    if section.get("max_tokens", "").strip():
+        max_tokens = section.getint("max_tokens")
+        if max_tokens < 1:
+            raise ValueError("[llm] max_tokens는 양의 정수여야 합니다.")
+        body["max_tokens"] = max_tokens
     response = requests.post(url, headers=headers, timeout=section.getfloat("timeout_seconds", 180),
-                             allow_redirects=False, json={"model": model, "temperature": 0,
-                             "messages": [{"role": "system", "content": prompt},
-                                          {"role": "user", "content": payload}]})
+                             allow_redirects=False, json=body)
     if response.status_code != 200:
         raise ValueError(f"사내 AI 응답 HTTP {response.status_code}")
     choice = response.json()["choices"][0]
@@ -125,7 +138,7 @@ def main():
                         print(key[0], "재사용")
                         continue
                     if search is None:
-                        llm = read_config(base / settings["llm_config"])
+                        llm = load_llm_settings(config, base)
                         prompt = (HERE / "review_prompt.txt").read_text(encoding="utf-8")
                         search = RegulationSearch(base / settings["index_path"], settings["guide_source"], settings["guide_sheet"])
                     print(key[0], review_one(store, sop, revision, digest, rows, search, prompt, llm,
