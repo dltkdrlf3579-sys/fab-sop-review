@@ -15,7 +15,7 @@ from uuid import uuid4
 import requests
 
 from fab_batch import input_notes, load_fab_sops, load_sql_adapter, read_config
-from regulation_search import RegulationSearch
+from regulation_search import RANKING_VERSION, RegulationSearch
 from notifications import deliver_pending
 from result_store import ReviewStore
 
@@ -145,6 +145,12 @@ def review_step(config, prompt, payload, rows, step, evidence):
 
 def run_reviews(documents, store, config, base, counts):
     settings = config["review"]
+    declared_sheets = settings.get("other_area_sheets")
+    if declared_sheets is None:
+        defaults = read_config(HERE / "config.example.ini")["review"]
+        same_guide = all(settings[k] == defaults[k] for k in ("guide_source", "guide_sheet"))
+        declared_sheets = defaults.get("other_area_sheets", "") if same_guide else ""
+    other_area_sheets = sorted({name.strip() for name in declared_sheets.split(",") if name.strip()})
     workers = settings.getint("max_concurrent_requests", fallback=50)
     if not 1 <= workers <= 50:
         raise ValueError("max_concurrent_requests는 1~50 사이여야 합니다.")
@@ -168,10 +174,11 @@ def run_reviews(documents, store, config, base, counts):
         if doc.errors:
             report(doc.label, "검토 미완료", f" | 보류 {len(doc.errors)}행")
             return
-        findings = [item for n in sorted(doc.results) for item in doc.results[n]]
+        findings = [item for n in sorted(doc.results) for item in doc.results[n]["findings"]]
+        candidates = {n: data["candidates"] for n, data in doc.results.items()}
         with waiting(f"{doc.label} | DB 저장 중"):
             status = store.save(doc.sop, doc.revision, doc.digest, doc.rows, findings,
-                                search.index_hash, prompt_hash, model, doc.key)
+                                search.index_hash, prompt_hash, model, doc.key, candidates)
         report(doc.label, status)
 
     def hold_row(doc, step, error):
@@ -184,16 +191,17 @@ def run_reviews(documents, store, config, base, counts):
             finished, _ = wait(pending, timeout=15, return_when=FIRST_COMPLETED)
             if finished:
                 break
-            elapsed = int(monotonic() - min(start for _, _, start in pending.values()))
+            elapsed = int(monotonic() - min(start for _, _, start, _ in pending.values()))
             print(f"AI 응답 대기 | 진행 중 {len(pending)}행 | 가장 오래된 요청 경과 {elapsed}초", flush=True)
         for future in finished:
-            doc, step, _ = pending.pop(future)
+            doc, step, _, candidates = pending.pop(future)
             try:
                 findings = future.result()
             except ROW_ERRORS as exc:
                 hold_row(doc, step, exc)
             else:
-                doc.results[step] = store.save_step(doc.sop, doc.key, step, findings)
+                result = {"findings": findings, "candidates": candidates}
+                doc.results[step] = store.save_step(doc.sop, doc.key, step, result)
                 check_progress(doc)
 
     try:
@@ -217,9 +225,10 @@ def run_reviews(documents, store, config, base, counts):
                     model = llm["llm"].get("model_name") or llm["llm"].get("model", "")
                     with waiting("규정 색인 로딩 중"):
                         search = RegulationSearch(base / settings["index_path"], settings["guide_source"],
-                                                  settings["guide_sheet"], evidence_limit)
+                                                  settings["guide_sheet"], evidence_limit, other_area_sheets)
                 numbered = [dict(row, step=i) for i, row in enumerate(rows, 1)]
-                key_data = [sop, revision, numbered, search.index_hash, prompt_hash, model,
+                key_data = [sop, revision, numbered, search.index_hash, RANKING_VERSION, prompt_hash, model,
+                            settings["guide_source"], settings["guide_sheet"], other_area_sheets,
                             llm["llm"].get("base_url"), llm["llm"].get("max_tokens"), evidence_limit]
                 key = hashlib.sha256(encode(key_data).encode()).hexdigest()
                 resumed = store.load_steps(sop, key)
@@ -243,7 +252,9 @@ def run_reviews(documents, store, config, base, counts):
                         hold_row(doc, step, f"입력 길이 설정 초과 (입력 {size:,}자 / 설정 {char_limit:,}자)")
                         continue
                     future = pool.submit(review_step, llm, prompt, payload, rows, step, evidence)
-                    pending[future] = (doc, step, monotonic())
+                    candidates = [{"rank": rank, "id": entry["id"], "source": entry["source"],
+                                   "page": entry.get("page")} for rank, entry in enumerate(evidence, 1)]
+                    pending[future] = (doc, step, monotonic(), candidates)
                     print(f"{label} | AI 응답 대기 | 작업행 {step}/{len(rows)} "
                           f"(근거 {len(evidence)}개, 입력 {size:,}자)", flush=True)
             while pending:

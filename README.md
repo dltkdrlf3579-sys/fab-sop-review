@@ -33,6 +33,18 @@ LEFT JOIN ehs.ai_fab_sop_review_latest r
 
 `review_id`가 비면 연결된 완료 검토가 없고, `review_id`는 있으면서 `message`가 비면 해당 단계의 보완의견이 없습니다.
 
+검색은 하위작업의 작업명·내용을 우선하고 SOP 제목을 보조로 사용합니다. 설정된 가이드 파일에서 `other_area_sheets`에 명시한 타 영역 전용 시트만 제외합니다. 배포 가이드의 기본 제외 시트는 (Infra), (실험실)이며 공용 보호구 시트와 불티비산방지포 별첨은 검색합니다. 같은 조건의 규정·규칙·기준도 함께 순위에 오릅니다.
+
+새로 완료한 작업행은 결과 **이력 테이블**의 첫 의견 행(`finding_no = 1`)에 `search_candidates`를 기록합니다. 순위순 JSON 배열의 `rank`, `id`, `source`, `page`, `cited`로 AI에 보낸 후보와 해당 작업에서 실제 인용된 근거를 대조할 수 있습니다. 의견이 없는 행도 기록합니다. 이전 완료 이력은 NULL이며 이전 버전의 미완료 검토는 새 검색으로 다시 시작합니다. 기본 자동 생성 설정에서는 기존 테이블에 열을 추가합니다. 수동 스키마 관리 환경은 실행 전에 결과 테이블에 `search_candidates TEXT` 열을 추가하세요.
+
+```sql
+SELECT sopr_no, sopr_main_seq, sopr_sub_seq, message, search_candidates
+FROM ai_fab_sop_review
+WHERE finding_no = 1 AND search_candidates IS NOT NULL
+ORDER BY reviewed_at DESC, step
+LIMIT 30;
+```
+
 메일은 기본적으로 결과 테이블의 검토당 첫 행에 발송대기 상태(`mail_state=pending`)를 기록합니다. 담당자 공용 메일함으로 발송하려면 `[mail]`의 서버·발신자·수신자를 설정하고 `enabled = true`로 바꿉니다. 외부 주소로 자동 추정하지 않습니다. 발송 여부가 불명확한 상태(`sending`)는 메일 서버 이력 확인 후 실제 발송됐으면 `sent`, 발송되지 않았으면 `pending`으로 조정합니다. 의견 0건은 메일이 없습니다.
 
 사내 Windows에서 일괄 실행을 등록하려면 PowerShell에서 `.\register_daily.ps1 -At "08:00"`을 실행하세요. 지정 시각은 PC 현지 시각이고 실행 계정의 DB·파일·메일 접근 권한이 적용됩니다. 기본 등록은 로그인 계정 기준이며 무인 서비스 계정이 필요한 환경에서는 사내 작업 스케줄러 설정을 적용하세요.

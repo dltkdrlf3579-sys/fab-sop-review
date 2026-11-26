@@ -8,11 +8,11 @@ from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from threading import Event, Lock
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from run_daily import HERE, load_llm_settings, main, request_review, run_reviews, waiting
 from notifications import deliver_pending
-from regulation_search import RegulationSearch
+from regulation_search import RegulationSearch, words
 from fab_batch import read_config
 from result_store import ReviewStore, relation
 
@@ -29,19 +29,48 @@ class DailyReviewTest(unittest.TestCase):
             return {"SOP제목": "", "주작업명": "", "하위작업내용": term}
         records = [item("other-guide", "gamma"), item("matched-guide", "alpha"),
                    item("matched-rule", "beta", rule=True)]
+        records.append(dict(item("different-sheet", "beta"), text="자료 시트: OTHER\nbeta"))
+        records.append(dict(item("shared-appendix", "delta"), text="자료 시트: APPENDIX\ndelta"))
         records.extend(item(str(i), "alpha", rule=True) for i in range(32))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fixture.jsonl"
             path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
-            search = RegulationSearch(path, "fixture", "FAB", 2)
+            search = RegulationSearch(path, "fixture", "FAB", 2, ["OTHER"])
             self.addCleanup(search.db.close)
             self.assertEqual(len(search.evidence(step("alpha"))), 2)
             self.assertEqual(search.evidence(step("alpha"))[0]["id"], "matched-guide")
             self.assertEqual([r["id"] for r in search.evidence(step("beta"))], ["matched-rule"])
+            self.assertEqual([r["id"] for r in search.evidence(step("delta"))], ["shared-appendix"])
+            mixed = dict(step("1. beta 2) beta"), SOP제목="gamma")
+            self.assertEqual(search.evidence(mixed)[0]["id"], "matched-rule")
             self.assertEqual(search.evidence(step("absent")), [])
             default_search = RegulationSearch(path, "fixture", "FAB")
             self.addCleanup(default_search.db.close)
             self.assertEqual(len(default_search.evidence(step("alpha"))), 20)
+
+    def test_numbering_does_not_compete_with_measurements(self):
+        self.assertEqual(list(words("1. ０.１kPa 2) 1/2인치 N2")), list(words("0.1 kPa 1/2 인치 N2")))
+        self.assertNotEqual(list(words("0.1")), list(words("0 1")))
+        self.assertNotEqual(list(words("1/2")), list(words("1.2")))
+
+    def test_trace_preserves_rank_and_all_citations_on_first_record(self):
+        db = MagicMock()
+        cur = db.cursor.return_value.__enter__.return_value
+        cur.fetchone.side_effect = [None, ("2026-11-26",)]
+        store = ReviewStore(db, {"result_history_table": "fixture"})
+        row = dict(zip(("SOP제목","주작업순번","주작업명","하위작업순번","하위작업내용"),
+                       ("title","1","work","1","body")))
+        def candidate(rank, key):
+            return {"rank": rank, "id": key, "source": "fixture", "page": None}
+        candidates = {1: [candidate(1,"a"), candidate(2,"b"), candidate(3,"c")], 2: [candidate(1,"b")]}
+        findings = [(1,"확인 요청","확인해 주세요.",key,"fixture",None,"quote") for key in ("c","a")]
+        store.save("A","1","digest",[row, dict(row, 하위작업순번="2")],findings,"idx","prompt","model",
+                   "workkey",candidates)
+        _, records = cur.executemany.call_args.args
+        self.assertEqual([(c["id"], c["rank"], c["cited"]) for c in json.loads(records[0][-1])],
+                         [("a",1,True), ("b",2,False), ("c",3,True)])
+        self.assertIsNone(records[1][-1])
+        self.assertEqual(json.loads(records[2][-1]), [dict(candidates[2][0], cited=False)])
 
     def test_waiting_reports_until_stage_ends(self):
         reported = Event()
@@ -67,7 +96,8 @@ class DailyReviewTest(unittest.TestCase):
             search.return_value.index_hash = "idx"
             store.return_value.save_step.side_effect = lambda sop, key, step, findings: findings
             store.return_value.save.return_value = "검토 완료"
-            search.return_value.evidence.side_effect = [[{"ref": "E1", "text": "근거"}], [{"text": "x" * 160000}]]
+            search.return_value.evidence.side_effect = [[{"ref": "E1", "text": "근거", "id": "x",
+                                                         "source": "fixture"}], [{"text": "x" * 160000}]]
             self.assertEqual(main(), 1)
             api.assert_called_once()
         lines = output.getvalue()
@@ -138,6 +168,9 @@ class DailyReviewTest(unittest.TestCase):
             self.assertEqual(peak, 50)
             self.assertEqual(run(), {"검토 완료": 1, "검토 미완료": 0, "재사용": 1})
             self.assertEqual(hits[60:], [("B", 30)])
+            traces = store.save.call_args.args[-1]
+            self.assertEqual(len(traces), 30)
+            self.assertEqual(traces[1], [{"rank": 1, "id": "1", "source": "fixture", "page": 1}])
             cfg["review"]["max_concurrent_requests"] = "51"
             with self.assertRaises(ValueError):
                 run()
