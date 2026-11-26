@@ -18,6 +18,40 @@ from result_store import ReviewStore, relation
 
 
 class DailyReviewTest(unittest.TestCase):
+    def test_existing_config_without_example_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "review_prompt.txt").write_bytes((HERE / "review_prompt.txt").read_bytes())
+            path = folder / "config.ini"
+            cfg = read_config(HERE / "config.example.ini")
+            guide = cfg["review"]["guide_source"]
+            defaults = [name.strip() for name in cfg["review"]["other_area_sheets"].split(",")]
+            docs = {("A", "1"): [{"SOP제목": "연습", "주작업순번": "1", "주작업명": "준비",
+                                 "하위작업순번": "1", "하위작업내용": "작업 준비"}]}
+            for source, option, expected in ((guide, None, defaults), ("custom.xlsx", None, []),
+                                              (guide, "", []), (guide, "X, Y", ["X", "Y"])):
+                with self.subTest(source=source, option=option):
+                    cfg["review"]["guide_source"] = source
+                    cfg.remove_option("review", "other_area_sheets")
+                    if option is not None:
+                        cfg["review"]["other_area_sheets"] = option
+                    with path.open("w", encoding="utf-8") as stream:
+                        cfg.write(stream)
+                    store = Mock()
+                    store.is_current.return_value = False
+                    store.load_steps.return_value = {}
+                    store.save_step.side_effect = lambda sop, key, step, result: result
+                    store.save.return_value = "검토 완료"
+                    with (patch("run_daily.HERE", folder), patch("run_daily.RegulationSearch") as search,
+                          patch("run_daily.request_review", return_value={"status":"complete","findings":[]}),
+                          redirect_stdout(StringIO())):
+                        search.return_value.index_hash = "fixture"
+                        search.return_value.evidence.return_value = [{"id":"x","source":"test","ref":"E1"}]
+                        counts = dict.fromkeys(("검토 완료","재사용","검토 미완료"), 0)
+                        run_reviews(docs, store, read_config(path), folder, counts)
+                        self.assertEqual(counts["검토 완료"], 1)
+                        self.assertEqual(search.call_args.args[-1], expected)
+
     def test_guide_and_rules_compete_by_step_without_unconditional_guide_rows(self):
         guide = {"domain": "safety_training", "document_type": "guide", "reference_only": False,
                  "source_status": "active", "registry_hash_status": "verified", "structured_record": True,

@@ -20,6 +20,9 @@ from notifications import deliver_pending
 from result_store import ReviewStore
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_OTHER_AREA_SHEETS = {
+    ("통합 환경안전 SOP 가이드_2026-08-27.xlsx", "환경안전가이드(FAB)"): "(Infra), (실험실)",
+}
 
 
 @contextmanager
@@ -145,11 +148,8 @@ def review_step(config, prompt, payload, rows, step, evidence):
 
 def run_reviews(documents, store, config, base, counts):
     settings = config["review"]
-    declared_sheets = settings.get("other_area_sheets")
-    if declared_sheets is None:
-        defaults = read_config(HERE / "config.example.ini")["review"]
-        same_guide = all(settings[k] == defaults[k] for k in ("guide_source", "guide_sheet"))
-        declared_sheets = defaults.get("other_area_sheets", "") if same_guide else ""
+    guide = (settings["guide_source"], settings["guide_sheet"])
+    declared_sheets = settings.get("other_area_sheets", DEFAULT_OTHER_AREA_SHEETS.get(guide, ""))
     other_area_sheets = sorted({name.strip() for name in declared_sheets.split(",") if name.strip()})
     workers = settings.getint("max_concurrent_requests", fallback=50)
     if not 1 <= workers <= 50:
