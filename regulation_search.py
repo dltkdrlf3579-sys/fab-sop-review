@@ -1,6 +1,7 @@
 """Local BM25 search over reviewed text from the portable JSONL index."""
 from collections import Counter
 import hashlib
+from itertools import zip_longest
 import json
 from pathlib import Path
 import re
@@ -15,11 +16,14 @@ def terms(text):
 
 
 class RegulationSearch:
-    def __init__(self, path: Path, guide_source: str, guide_sheet: str):
+    def __init__(self, path: Path, guide_source: str, guide_sheet: str, max_evidence_items: int = 20):
+        if max_evidence_items < 1:
+            raise ValueError("max_evidence_items는 양수여야 합니다.")
+        self.max_evidence_items = max_evidence_items
         self.db = sqlite3.connect(":memory:")
         self.db.execute("CREATE VIRTUAL TABLE search USING fts5(tokens)")
         self.records = {}
-        self.guide = []
+        has_guide = False
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for line in stream:
@@ -37,15 +41,16 @@ class RegulationSearch:
                                      "page": item.get("page"), "text": body}
                 if item["source"] == guide_source and item.get("structured_record") and (
                         f"자료 시트: {guide_sheet}" in body.splitlines()):
-                    self.guide.append(num)
+                    has_guide = True
                 self.db.execute("INSERT INTO search(rowid,tokens) VALUES (?,?)",
                                 (num, " ".join(terms(body))))
         self.index_hash = digest.hexdigest()
-        if not self.guide:
+        if not has_guide:
+            self.db.close()
             raise ValueError("색인에서 설정한 FAB 가이드 시트의 구조화 행을 찾지 못했습니다.")
 
     def evidence(self, rows):
-        selected = dict.fromkeys(self.guide)
+        ranked_steps = []
         for row in rows:
             query = " ".join(row[key] for key in ("SOP제목", "주작업명", "하위작업내용"))
             keywords = [word for word, _ in Counter(terms(query)).most_common(100)]
@@ -54,6 +59,13 @@ class RegulationSearch:
             expression = " OR ".join(f'"{word}"' for word in keywords)
             hits = self.db.execute("SELECT rowid FROM search WHERE search MATCH ? ORDER BY rank, rowid LIMIT 8",
                                    (expression,))
-            for (num,) in hits:
+            ranked_steps.append([num for (num,) in hits])
+        selected = {}
+        for rank in zip_longest(*ranked_steps):
+            for num in rank:
+                if num is None:
+                    continue
                 selected[num] = None
+                if len(selected) == self.max_evidence_items:
+                    return [self.records[n] for n in selected]
         return [self.records[num] for num in selected]

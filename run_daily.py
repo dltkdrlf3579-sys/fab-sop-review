@@ -120,12 +120,14 @@ def review_one(store, sop, revision, digest, rows, search, prompt, llm_config, l
         raise ValueError("입력 확인: " + " ".join(problems))
     with waiting(f"{label} | 규정 검색 중 (작업 {len(rows)}행)"):
         evidence = search.evidence(rows)
+    if not evidence:
+        raise ValueError("작업 내용과 일치하는 규정 근거를 찾지 못했습니다.")
     payload = encode({"rows": [dict(row, step=i) for i, row in enumerate(rows, 1)],
                       "evidence": evidence})
     size = len(prompt) + len(payload)
     if size > limit:
         raise ValueError(f"입력 길이 설정 초과 (입력 {size:,}자 / 설정 {limit:,}자). 원문을 생략하지 않고 보류합니다.")
-    with waiting(f"{label} | AI 응답 대기 (입력 {size:,}자)"):
+    with waiting(f"{label} | AI 응답 대기 (근거 {len(evidence)}개, 입력 {size:,}자)"):
         response = request_review(llm_config, prompt, payload)
     findings = validate(response, rows, evidence)
     model = llm_config["llm"].get("model_name") or llm_config["llm"]["model"]
@@ -175,7 +177,10 @@ def main():
                             llm = load_llm_settings(config, base)
                             prompt = (HERE / "review_prompt.txt").read_text(encoding="utf-8")
                             with waiting(f"{label} | 규정 색인 로딩 중"):
-                                search = RegulationSearch(base / settings["index_path"], settings["guide_source"], settings["guide_sheet"])
+                                search = RegulationSearch(
+                                    base / settings["index_path"], settings["guide_source"], settings["guide_sheet"],
+                                    settings.getint("max_evidence_items", fallback=20),
+                                )
                         status = review_one(store, sop, revision, digest, rows, search, prompt, llm,
                                             settings.getint("max_input_chars"), label)
                 except (ValueError, KeyError, TypeError, IndexError, requests.RequestException) as exc:

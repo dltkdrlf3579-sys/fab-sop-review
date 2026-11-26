@@ -12,11 +12,36 @@ from unittest.mock import Mock, patch
 
 from run_daily import HERE, load_llm_settings, main, request_review, waiting
 from notifications import deliver_pending
+from regulation_search import RegulationSearch
 from fab_batch import read_config
 from result_store import ReviewStore, relation
 
 
 class DailyReviewTest(unittest.TestCase):
+    def test_guide_and_rules_compete_by_step_without_unconditional_guide_rows(self):
+        guide = {"domain": "safety_training", "document_type": "guide", "reference_only": False,
+                 "source_status": "active", "registry_hash_status": "verified", "structured_record": True,
+                 "source": "fixture", "text": "자료 시트: FAB\n"}
+        def item(key, term, rule=False):
+            return dict(guide, id=key, text=guide["text"] + term,
+                        source="rules" if rule else "fixture", document_type="rule" if rule else "guide")
+        def step(term):
+            return {"SOP제목": "", "주작업명": "", "하위작업내용": term}
+        records = [item("other-guide", "gamma"), item("matched-guide", "alpha"),
+                   item("matched-rule", "beta", rule=True)]
+        records.extend(item(str(i), "alpha", rule=True) for i in range(12))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fixture.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+            search = RegulationSearch(path, "fixture", "FAB", 2)
+            self.addCleanup(search.db.close)
+            result = search.evidence([step("alpha"), step("alpha"), step("beta")])
+            self.assertEqual([r["id"] for r in result], ["matched-guide", "matched-rule"])
+            self.assertEqual(search.evidence([step("absent")]), [])
+            default_search = RegulationSearch(path, "fixture", "FAB")
+            self.addCleanup(default_search.db.close)
+            self.assertEqual(len(default_search.evidence([step("alpha")])), 8)
+
     def test_waiting_reports_until_stage_ends(self):
         reported = Event()
         with patch("builtins.print", side_effect=lambda line, **kw: reported.set() if "경과" in line else None) as log:
@@ -38,7 +63,7 @@ class DailyReviewTest(unittest.TestCase):
               redirect_stdout(output), redirect_stderr(output)):
             store.return_value.is_current.side_effect = [False, True, False]
             store.return_value.save.return_value = "검토 완료"
-            search.return_value.evidence.side_effect = [[], [{"text": "x" * 160000}]]
+            search.return_value.evidence.side_effect = [[{"ref": "E1", "text": "근거"}], [{"text": "x" * 160000}]]
             self.assertEqual(main(), 1)
             api.assert_called_once()
         lines = output.getvalue()
